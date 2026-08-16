@@ -59,26 +59,39 @@ for normal Docker; `heroku.yml` passes `0777`).
 
 ## 2. Pinning the version
 
-This tree is **not currently a git repository** (no `.git`), so no commit SHA
-can be recorded automatically and `hermes dump` will report `(unknown)`.
+This repository is a **fork with its own history**, not a mirror tracking
+upstream. Two different things are worth pinning, and they are not the same:
 
-Before deploying, record the pin here:
+| Pin | Value | Meaning |
+|---|---|---|
+| **Hermes version** | `0.20.1` (from `pyproject.toml`) | The upstream Hermes code this recipe was validated against. This is the pin the `HermesRuntimeSpecification` records. |
+| **Recipe baseline commit** | `1fc3975` | The commit in *this* repo that established the Heroku layer. A documentation anchor for "what the recipe looked like when validated" — not a build input. |
 
-- **Hermes version (from `pyproject.toml`):** `0.20.1`
-- **Upstream commit SHA:** `__RECORD_ON_FIRST_PUSH__`
+The upstream `NousResearch/hermes-agent` commit SHA is **not recoverable**: this
+tree was imported from an extracted snapshot rather than cloned, so no upstream
+history exists here. If exact upstream provenance matters later, diff this tree
+against upstream tag `v0.20.1` and record the result.
 
-Once the repo is initialized and pushed, pass the SHA into the build so it is
-baked into the image (`hermes_cli/build_info.py` reads it):
+Do not track upstream `main`. Take upstream changes as deliberate, reviewed
+merges, and re-validate the exit criteria in §8 after each one.
 
-```yaml
-# heroku.yml
-build:
-  config:
-    HERMES_DATA_MODE: "0777"
-    HERMES_GIT_SHA: "<sha>"
+### Why `HERMES_GIT_SHA` is deliberately not set in `heroku.yml`
+
+`hermes_cli/build_info.py` reads a baked `HERMES_GIT_SHA` build arg so
+`hermes dump` and the startup banner can report the running commit. It is
+tempting to hardcode it in `heroku.yml`, but a static value there goes stale on
+the very next commit and then **actively misreports** which code is running —
+worse than the honest `(unknown)` it replaces.
+
+If you want an accurate baked SHA for a specific deploy, pass it at build time
+instead of committing it:
+
+```bash
+heroku config:set -a hermes-agent-wao-heroku HEROKU_BUILD_SHA="$(git rev-parse HEAD)"
 ```
 
-Do not track upstream `main`.
+Otherwise rely on `heroku releases`, which records the deployed commit per
+release without any risk of drift.
 
 ---
 
