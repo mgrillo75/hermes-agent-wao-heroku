@@ -1,0 +1,17 @@
+# Heroku container-stack build/run recipe for the hermes-agent reference
+# deployment. See HEROKU.md for required config vars and the test procedure.
+#
+# The Dockerfile's final stage is the Heroku-adapted `heroku` stage (Heroku
+# builds the last stage; it cannot select a target). The run command is also
+# the image ENTRYPOINT — the entrypoint tolerates receiving itself as $1, so
+# behavior is identical whether Heroku honors ENTRYPOINT or execs `run`.
+build:
+  docker:
+    web: Dockerfile
+  config:
+    # Makes /opt/data writable by the random unprivileged UID Heroku assigns.
+    # Must be a build arg: /opt/data is a declared VOLUME, so it cannot be
+    # chmod'ed in any later build step. Default in the Dockerfile is 0755.
+    HERMES_DATA_MODE: "0777"
+run:
+  web: /opt/hermes/docker/heroku-entrypoint.sh

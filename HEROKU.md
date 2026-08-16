@@ -1,0 +1,231 @@
+# Hermes on Heroku — Reference Deployment
+
+This is the **reference/test runtime** described in Section 12A of the WAO
+Bootstrapper specification. It exists to establish a known-good, reproducible
+Hermes deployment recipe on Heroku. It is not a production WAO runtime, and
+`bootstrapper-wao` must never clone this app's mutable state — it reuses the
+deployment *definition* only.
+
+Upstream Hermes is kept intact. The Heroku layer is four files:
+
+| File | Purpose |
+|---|---|
+| `heroku.yml` | Build/run recipe; passes `HERMES_DATA_MODE=0777` |
+| `docker/heroku-entrypoint.sh` | Non-root boot path; replaces s6 + `main-wrapper.sh` |
+| `Dockerfile` (2 small additions) | `HERMES_DATA_MODE` build arg; final `heroku` stage |
+| `HEROKU.md` | This document |
+
+---
+
+## 1. Why the upstream image cannot run unmodified
+
+Heroku's container runtime **ignores `USER` and runs the image as a random,
+unprivileged UID** with no `/etc/passwd` entry and no root. The upstream boot
+path is incompatible with that in three specific places:
+
+1. `docker/stage2-hook.sh` **exits 1** when started as an arbitrary non-root,
+   non-`hermes` UID (it needs root for `usermod`/`groupmod`/`chown`).
+2. `docker/main-wrapper.sh` has the **same hard rejection**, plus a
+   `s6-setuidgid` privilege drop that requires root.
+3. s6-overlay's `/init` requires PID 1. The upstream dispatcher does have a
+   non-PID-1 fallback, but it still routes into `stage2-hook.sh` +
+   `main-wrapper.sh`, so it hits rejections (1) and (2) anyway.
+
+`docker/heroku-entrypoint.sh` sidesteps all three: no `/init`, no
+`s6-setuidgid`, no user remapping. It re-implements the **non-privileged
+subset** of `stage2-hook.sh` inline — data-tree seeding, config seeding,
+`API_SERVER_KEY` generation, config migration, skills sync, and Chromium
+discovery — then execs the web process directly.
+
+### The `/opt/data` permission fix is a build arg, not a `chmod`
+
+`/opt/data` is declared a `VOLUME`, and **Docker discards any build-step write
+to a path after it has been declared a volume**. A `chmod` in a later stage is
+silently voided — the container then fails at boot with `EACCES` and the image
+looks correct on inspection. The fix is therefore applied *before* the `VOLUME`
+instruction, via the `HERMES_DATA_MODE` build arg (default `0755`, unchanged
+for normal Docker; `heroku.yml` passes `0777`).
+
+### What this deployment gives up (deliberately)
+
+- **No supervised services.** No s6 tree, so per-profile gateway supervision
+  and the auto-restart behavior are absent here.
+- **No persistence.** `/opt/data` is ordinary ephemeral dyno filesystem.
+  Heroku discards it on every restart/replace **and cycles dynos roughly every
+  24 hours**. Cataloguing exactly what disappears is the point of this
+  deployment (spec Section 16).
+
+---
+
+## 2. Pinning the version
+
+This tree is **not currently a git repository** (no `.git`), so no commit SHA
+can be recorded automatically and `hermes dump` will report `(unknown)`.
+
+Before deploying, record the pin here:
+
+- **Hermes version (from `pyproject.toml`):** `0.20.1`
+- **Upstream commit SHA:** `__RECORD_ON_FIRST_PUSH__`
+
+Once the repo is initialized and pushed, pass the SHA into the build so it is
+baked into the image (`hermes_cli/build_info.py` reads it):
+
+```yaml
+# heroku.yml
+build:
+  config:
+    HERMES_DATA_MODE: "0777"
+    HERMES_GIT_SHA: "<sha>"
+```
+
+Do not track upstream `main`.
+
+---
+
+## 3. Create the app
+
+The container stack + `heroku.yml` build is a **Cedar-generation** mechanism.
+Create the app explicitly on Cedar so the recipe is reproducible:
+
+```bash
+heroku create hermes-agent-wao-heroku --stack container
+heroku stack:set container -a hermes-agent-wao-heroku
+```
+
+Then either connect the GitHub repo in the Heroku Dashboard, or push directly:
+
+```bash
+git push heroku main
+```
+
+**Dyno size:** start at **Performance-M**. Chromium/Playwright plus the Python
+and Node runtimes will not fit a 512 MB Standard-1X dyno.
+
+```bash
+heroku ps:type web=performance-m -a hermes-agent-wao-heroku
+```
+
+Eco/Basic dynos sleep on inactivity and must not be used.
+
+---
+
+## 4. Required config vars
+
+Secrets go here, never into the repo. `.env.example` is reference only; the
+entrypoint writes a `.env` containing just the generated loopback
+`API_SERVER_KEY`.
+
+**Dashboard authentication (required — it fails closed).** The dashboard's
+auth gate engages automatically on a non-loopback bind and refuses to start
+without a provider. `HERMES_DASHBOARD_INSECURE` no longer disables it.
+
+```bash
+heroku config:set -a hermes-agent-wao-heroku \
+  HERMES_DASHBOARD=1 \
+  HERMES_DASHBOARD_BASIC_AUTH_USERNAME=<user> \
+  HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=<strong-password>
+```
+
+(Or `HERMES_DASHBOARD_OAUTH_CLIENT_ID` for the bundled Nous OAuth provider.)
+
+**Model/provider credentials** — whichever provider you are testing against,
+e.g. `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or a Nous session via
+`HERMES_AUTH_JSON_BOOTSTRAP`.
+
+**Do not set `PORT`.** Heroku assigns it at dyno start; it cannot be set as a
+config var.
+
+### Optional
+
+| Var | Effect |
+|---|---|
+| `HEROKU_WEB_CMD` | Overrides the web process command without rebuilding the image (see §6) |
+| `HERMES_GATEWAY_BOOTSTRAP_STATE=running` | Honored by upstream boot only; **no effect here** (no s6 reconciler) |
+| `API_SERVER_HOST` / `API_SERVER_PORT` | Move the gateway api_server off its `127.0.0.1:8642` default |
+
+---
+
+## 5. Default exposed surface
+
+The default web process is the **auth-gated dashboard bound to `$PORT`**,
+mirroring upstream's own hosted topology: the dashboard is the single public
+door, and the gateway `api_server` stays on loopback behind `API_SERVER_KEY`.
+
+Exactly one process can receive routed traffic — Heroku routes inbound HTTP
+only to the `web` process. Everything else stays localhost-only inside the dyno.
+
+---
+
+## 6. Switching to the gateway/API surface
+
+`bootstrapper-wao` ultimately needs a programmatic control surface, not a
+dashboard. The api_server exposes `GET /health` and is env-configurable, so it
+can be promoted to the public port without an image rebuild:
+
+```bash
+heroku config:set -a hermes-agent-wao-heroku \
+  HEROKU_WEB_CMD='API_SERVER_HOST=0.0.0.0 API_SERVER_PORT=$PORT hermes gateway run --replace'
+```
+
+`$PORT` stays single-quoted so it is expanded at dyno start, not by your shell.
+
+**This path is unvalidated** — whether the gateway starts cleanly under Heroku's
+constraints and whether `api_server` is enabled by default in the gateway's
+platform config are open questions. Resolving them is part of the exit criteria
+below, and the answer determines the `HermesRuntimeSpecification`'s
+`required exposed service/API behavior` field.
+
+---
+
+## 7. Known constraints to test against
+
+| Constraint | What to watch for |
+|---|---|
+| 60s web boot timeout (R10) | Hermes may not bind `$PORT` in time. If it fails, ask Heroku support to extend to 120/180s and **record that the recipe depends on it** |
+| ~30s router request timeout | Any request that triggers real agent work will exceed it; the bootstrapper needs an async/polling pattern |
+| Random non-root UID | Any `EACCES` means a path needs opening before the `VOLUME` line |
+| Daily dyno cycling | All `/opt/data` state is lost; expected |
+| Large image | Measure build time and cold-start time |
+
+---
+
+## 8. Exit criteria (spec §12A)
+
+Record every result; these become the `HermesRuntimeSpecification`.
+
+- [ ] Image builds on Heroku via `heroku.yml`
+- [ ] Container starts under the random non-root UID with no `EACCES`
+- [ ] Web process binds `$PORT` inside the boot window
+- [ ] Process stays running (no crash loop); dyno cycling observed and timed
+- [ ] Health can be inspected programmatically (`GET /health` reachable)
+- [ ] The API/gateway surface the bootstrapper needs is reachable and
+      authenticated (see §6)
+- [ ] Long operations survive the router timeout via an async pattern
+- [ ] A profile can be created, inspected, started, stopped, deleted
+- [ ] Multiple profiles coexist in one runtime
+- [ ] Full inventory of state lost on restart, classified as reconstructable
+      config / durable state / secret / cache / temp
+- [ ] Measured peak memory and the minimum viable dyno size
+- [ ] Image build time and cold-start time
+- [ ] The deployment mechanism automation will reproduce (spec §13) exercised
+      end-to-end
+
+**Exit criterion:** a known-good deployment recipe exists and can be
+reproduced. Automated provisioning implements *this validated recipe* rather
+than inventing a topology.
+
+---
+
+## 9. Useful commands
+
+```bash
+heroku logs --tail -a hermes-agent-wao-heroku
+heroku ps -a hermes-agent-wao-heroku
+heroku run bash -a hermes-agent-wao-heroku          # one-off dyno; entrypoint passes args through
+heroku run hermes profile list -a hermes-agent-wao-heroku
+heroku releases -a hermes-agent-wao-heroku
+```
+
+One-off dynos get a **fresh, empty filesystem** — they do not share the web
+dyno's `/opt/data`. Inspect live runtime state through the web process, not
+through `heroku run`.
