@@ -65,10 +65,30 @@ seed_one "SOUL.md" "docker/SOUL.md"
 # file. The .env here only carries the generated loopback api_server key —
 # dyno-local and regenerated on every fresh filesystem, which is fine because
 # the dashboard and gateway that share it live in the same dyno.
+#
+# IMPORTANT — do not write a generated key when the operator supplied one.
+# Hermes resolves credentials with get_env_value_prefer_dotenv(), which
+# prefers $HERMES_HOME/.env OVER the process environment (hermes_cli/auth.py).
+# So a key written here would SHADOW an API_SERVER_KEY set as a Heroku config
+# var, and an external caller (the future bootstrapper) could never
+# authenticate against a key it knows. A supplied key also has to clear the
+# >=16-char usability bar or gateway/config.py refuses to enrol the api_server
+# platform at all — API_SERVER_ENABLED alone does NOT enable it.
 if [ ! -f "$HERMES_HOME/.env" ]; then
     : > "$HERMES_HOME/.env"
 fi
-if ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
+_supplied_key="${API_SERVER_KEY:-}"
+if [ -n "$_supplied_key" ]; then
+    if [ "${#_supplied_key}" -lt 16 ]; then
+        echo "[heroku] WARNING: API_SERVER_KEY is shorter than 16 characters; Hermes will refuse to start the api_server platform. Set a longer value." >&2
+    fi
+    # Leave .env free of the key so the process env (Heroku config var) is the
+    # single source of truth. Strip any key a previous boot generated.
+    if grep -q '^API_SERVER_KEY=' "$HERMES_HOME/.env" 2>/dev/null; then
+        sed -i '/^API_SERVER_KEY=/d' "$HERMES_HOME/.env" 2>/dev/null || true
+        echo "[heroku] Removed a previously generated API_SERVER_KEY from .env; using the supplied config var"
+    fi
+elif ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
     _gen_key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
     if [ -n "$_gen_key" ]; then
         printf 'API_SERVER_KEY=%s\n' "$_gen_key" >> "$HERMES_HOME/.env"
@@ -76,6 +96,7 @@ if ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
     fi
     unset _gen_key
 fi
+unset _supplied_key
 chmod 600 "$HERMES_HOME/.env" 2>/dev/null || true
 
 cd "$HERMES_HOME"
@@ -85,11 +106,81 @@ set +u
 . "$INSTALL_DIR/.venv/bin/activate"
 set -u
 
-# --- Config-schema migration + bundled skills sync (non-fatal, as upstream) ---
+# --- Config-schema migration (non-fatal, as upstream) ---
+# Runs BEFORE the model patch below so the patch writes into the migrated
+# schema and its values are what finally land on disk.
 if [ -f "$HERMES_HOME/config.yaml" ]; then
     python "$INSTALL_DIR/scripts/docker_config_migrate.py" \
         || echo "[heroku] Warning: docker_config_migrate.py failed; continuing" >&2
 fi
+
+# --- Apply the provider/model selection from Heroku config vars -------------
+# The seeded config.yaml comes from upstream's cli-config.yaml.example, which
+# ships model.default "anthropic/claude-opus-4.6", model.provider "auto" AND
+# model.base_url "https://openrouter.ai/api/v1". That combination is wrong for
+# every direct-provider deployment: "auto" resolves against whatever key it
+# finds, and the leftover OpenRouter base_url can send a direct provider's key
+# to OpenRouter and 401.
+#
+# There is no environment variable for provider/model in Hermes (LLM_MODEL is a
+# dead var per hermes_cli/config_migrations.py; HERMES_MODEL is CLI/cron
+# plumbing), so the selection has to be written into config.yaml. We patch it
+# here from two Heroku-layer vars rather than editing the upstream example
+# file, so provider switches need no image rebuild and upstream never drifts.
+#
+#   HERMES_MODEL_PROVIDER  e.g. anthropic | openai-api
+#   HERMES_MODEL_DEFAULT   e.g. claude-sonnet-5 | gpt-5.6-sol
+#
+# Naming a provider also DELETES model.base_url so the provider registry's own
+# inference_base_url is used. Idempotent: safe to re-run on every boot.
+#
+# Side effect: yaml.safe_dump rewrites config.yaml without the upstream
+# comments. Values are all Hermes reads, the dyno filesystem is ephemeral
+# anyway, and the documented example stays in the repo — so this is accepted.
+if [ -f "$HERMES_HOME/config.yaml" ] && \
+   { [ -n "${HERMES_MODEL_PROVIDER:-}" ] || [ -n "${HERMES_MODEL_DEFAULT:-}" ]; }; then
+    HERMES_CONFIG_PATH="$HERMES_HOME/config.yaml" python - <<'PY' \
+        || echo "[heroku] Warning: model config patch failed; continuing with seeded config" >&2
+import os
+import sys
+
+import yaml
+
+path = os.environ["HERMES_CONFIG_PATH"]
+provider = os.environ.get("HERMES_MODEL_PROVIDER", "").strip()
+default_model = os.environ.get("HERMES_MODEL_DEFAULT", "").strip()
+
+with open(path, encoding="utf-8") as fh:
+    cfg = yaml.safe_load(fh) or {}
+
+model = cfg.get("model")
+if not isinstance(model, dict):
+    model = {}
+
+changed = []
+if provider:
+    if model.get("provider") != provider:
+        model["provider"] = provider
+        changed.append(f"provider={provider}")
+    # A named direct provider must not inherit the seeded OpenRouter base_url.
+    if model.pop("base_url", None) is not None:
+        changed.append("removed base_url")
+if default_model and model.get("default") != default_model:
+    model["default"] = default_model
+    changed.append(f"default={default_model}")
+
+if not changed:
+    print("[heroku] Model config already correct; no change")
+    sys.exit(0)
+
+cfg["model"] = model
+with open(path, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(cfg, fh, sort_keys=False, allow_unicode=True)
+print("[heroku] Patched model config: " + ", ".join(changed))
+PY
+fi
+
+# --- Bundled skills sync (non-fatal, as upstream) ---
 if [ -d "$INSTALL_DIR/skills" ]; then
     python "$INSTALL_DIR/tools/skills_sync.py" \
         || echo "[heroku] Warning: skills_sync.py failed; continuing" >&2

@@ -124,9 +124,10 @@ Eco/Basic dynos sleep on inactivity and must not be used.
 
 ## 4. Required config vars
 
-Secrets go here, never into the repo. `.env.example` is reference only; the
-entrypoint writes a `.env` containing just the generated loopback
-`API_SERVER_KEY`.
+Secrets go here, never into the repo. `.env.example` is reference only. The
+entrypoint writes a `.env` containing only a generated loopback
+`API_SERVER_KEY`, and skips even that when you supply one as a config var
+(see §6).
 
 **Dashboard authentication (required — it fails closed).** The dashboard's
 auth gate engages automatically on a non-loopback bind and refuses to start
@@ -141,9 +142,38 @@ heroku config:set -a hermes-agent-wao-heroku \
 
 (Or `HERMES_DASHBOARD_OAUTH_CLIENT_ID` for the bundled Nous OAuth provider.)
 
-**Model/provider credentials** — whichever provider you are testing against,
-e.g. `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or a Nous session via
-`HERMES_AUTH_JSON_BOOTSTRAP`.
+**Model/provider selection (required).** The seeded `config.yaml` comes from
+upstream's `cli-config.yaml.example`, which ships
+`model.default: anthropic/claude-opus-4.6`, `model.provider: "auto"` **and**
+`model.base_url: https://openrouter.ai/api/v1`. That combination is wrong for
+any direct-provider deployment — `auto` resolves against whichever key it
+finds, and the leftover OpenRouter base URL can send a direct provider's key to
+OpenRouter and 401.
+
+There is no Hermes environment variable for provider/model (`LLM_MODEL` is a
+dead var; `HERMES_MODEL` is CLI/cron plumbing), so the entrypoint patches
+`config.yaml` from two Heroku-layer vars. Naming a provider also removes
+`model.base_url` so the provider registry's own base URL is used.
+
+| Var | Anthropic (default path) | OpenAI equivalent |
+|---|---|---|
+| `HERMES_MODEL_PROVIDER` | `anthropic` | `openai-api` |
+| `HERMES_MODEL_DEFAULT` | `claude-sonnet-5` | `gpt-5.6-sol` |
+| Credential | `ANTHROPIC_API_KEY` | `OPENAI_API_KEY` |
+| Base-URL override | `ANTHROPIC_BASE_URL` | `OPENAI_BASE_URL` |
+
+```bash
+heroku config:set -a hermes-agent-wao-heroku \
+  ANTHROPIC_API_KEY=<key> \
+  HERMES_MODEL_PROVIDER=anthropic \
+  HERMES_MODEL_DEFAULT=claude-sonnet-5
+```
+
+Valid model slugs come from `hermes_cli/models.py` (dots and dashes are
+interchangeable): Anthropic — `claude-fable-5`, `claude-sonnet-5`,
+`claude-opus-4-8`, `claude-opus-4-6`, `claude-haiku-4-5-20251001`;
+OpenAI — `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.5`, `gpt-5.4-mini`, `gpt-4o-mini`.
+A bare `gpt-5.6` is **not** a valid slug.
 
 **Do not set `PORT`.** Heroku assigns it at dyno start; it cannot be set as a
 config var.
@@ -153,6 +183,7 @@ config var.
 | Var | Effect |
 |---|---|
 | `HEROKU_WEB_CMD` | Overrides the web process command without rebuilding the image (see §6) |
+| `API_SERVER_KEY` | **Enables** the gateway api_server; must be ≥16 chars (see §6) |
 | `HERMES_GATEWAY_BOOTSTRAP_STATE=running` | Honored by upstream boot only; **no effect here** (no s6 reconciler) |
 | `API_SERVER_HOST` / `API_SERVER_PORT` | Move the gateway api_server off its `127.0.0.1:8642` default |
 
@@ -173,18 +204,30 @@ only to the `web` process. Everything else stays localhost-only inside the dyno.
 
 `bootstrapper-wao` ultimately needs a programmatic control surface, not a
 dashboard. The api_server exposes `GET /health` and is env-configurable, so it
-can be promoted to the public port without an image rebuild:
+can be promoted to the public port without an image rebuild.
+
+**`API_SERVER_KEY` is the enable switch, not `API_SERVER_ENABLED`.**
+`gateway/config.py` only enrols the api_server platform when `API_SERVER_KEY`
+is present and **≥16 characters** (`_has_usable_api_server_key`, mirroring the
+adapter's own startup guard). Setting `API_SERVER_ENABLED=true` on its own
+does nothing useful — the code comment notes it would load a platform whose
+adapter then refuses to start, leaving the reconnect watcher spinning.
+
+Supply the key as a config var so callers know it. The entrypoint deliberately
+does **not** write a generated key into `.env` when one is supplied, because
+Hermes prefers `$HERMES_HOME/.env` over the process environment and a
+generated key would otherwise shadow yours:
 
 ```bash
 heroku config:set -a hermes-agent-wao-heroku \
+  API_SERVER_KEY=<random-32-char-secret> \
   HEROKU_WEB_CMD='API_SERVER_HOST=0.0.0.0 API_SERVER_PORT=$PORT hermes gateway run --replace'
 ```
 
 `$PORT` stays single-quoted so it is expanded at dyno start, not by your shell.
 
 **This path is unvalidated** — whether the gateway starts cleanly under Heroku's
-constraints and whether `api_server` is enabled by default in the gateway's
-platform config are open questions. Resolving them is part of the exit criteria
+constraints is still an open question. Resolving it is part of the exit criteria
 below, and the answer determines the `HermesRuntimeSpecification`'s
 `required exposed service/API behavior` field.
 
