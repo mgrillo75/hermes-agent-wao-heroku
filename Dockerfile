@@ -144,12 +144,19 @@ RUN set -eu; \
 # tini CLI surface, then exec's /init + main-wrapper — see
 # docker/tini-shim.sh. Safe to drop once the affected catalogs are
 # updated.
-COPY --chmod=0755 docker/tini-shim.sh /usr/bin/tini
+# NOTE: `COPY --chmod=` is a BuildKit-only feature and Heroku's container
+# builder is the CLASSIC Docker builder, which fails with "the --chmod option
+# requires BuildKit". Every --chmod/--link in this file has therefore been
+# rewritten as COPY + RUN chmod. That builds identically under both builders,
+# so this is strictly more portable than the upstream form.
+COPY docker/tini-shim.sh /usr/bin/tini
+RUN chmod 0755 /usr/bin/tini
 
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN useradd -u 10000 -m -d /opt/data hermes
 
-COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+COPY --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/uv /usr/local/bin/uvx
 
 # Node 26: copy the node binary plus the bundled npm JS install from the
 # upstream image.  npm and npx are recreated as symlinks because they're
@@ -161,9 +168,10 @@ COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/loc
 #
 # See node_source stage at the top of the file for the version-bump
 # rationale (#4977).
-COPY --chmod=0755 --from=node_source /usr/local/bin/node /usr/local/bin/
+COPY --from=node_source /usr/local/bin/node /usr/local/bin/
 COPY --from=node_source /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
-RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+RUN chmod 0755 /usr/local/bin/node && \
+    ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
 WORKDIR /opt/hermes
@@ -277,13 +285,18 @@ RUN cd web && npm run build && \
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
-# --link decouples this layer from parents for cache purposes; --chmod bakes
-# the final read-only permissions at copy time so we skip the separate
-# `chmod -R` pass that previously walked ~30k files across the venv +
-# node_modules + source (21s amd64 / 222s arm64 — #49113).  `a+rX,go-w`
-# gives the non-root hermes user read + traverse but no write; root retains
-# write so the build steps below don't need chmod u+w dances.
-COPY --link --chmod=a+rX,go-w . .
+# Upstream used `COPY --link --chmod=a+rX,go-w . .` here. Both --link and
+# --chmod are BuildKit-only and Heroku uses the classic builder, so they are
+# dropped.
+#
+# Deliberately NOT replaced with a `chmod -R a+rX,go-w` pass: at this point
+# /opt/hermes already holds the venv and node_modules, so a recursive chmod
+# would rewrite ~30k files into a new layer (the 21s amd64 / 222s arm64 cost
+# #49113 removed) and duplicate ~1GB of image. The permissions it granted are
+# already satisfied without it — git stores these files 644/755, COPY
+# preserves the source mode, and root's umask gives group/other read but not
+# write. Files needing the exec bit are chmod'ed explicitly above and below.
+COPY . .
 
 # ---------- Permissions ----------
 # Link hermes-agent itself (editable). Deps are already installed in the
@@ -340,6 +353,13 @@ RUN if [ -n "${HERMES_GIT_SHA}" ]; then \
 # /run/service/ (tmpfs) and are reconciled on container restart by
 # /etc/cont-init.d/02-reconcile-profiles (Phase 4 Task 4.0).
 COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+# s6 requires run/finish to be executable, and COPY preserves the source mode.
+# These files are stored 100644 in this repository (the exec bit did not
+# survive the snapshot import from upstream), so without this chmod s6 cannot
+# start its services. Does not affect the Heroku path, which bypasses s6
+# entirely, but it keeps the normal-Docker image working.
+RUN find /etc/s6-overlay/s6-rc.d -type f \( -name run -o -name finish \) \
+        -exec chmod 0755 {} +
 
 # stage2-hook handles UID/GID remap, volume chown, config seeding,
 # skills sync — all the work the old entrypoint.sh did before
@@ -353,8 +373,9 @@ RUN mkdir -p /etc/cont-init.d && \
     printf '#!/command/with-contenv sh\nexec /opt/hermes/docker/stage2-hook.sh\n' \
         > /etc/cont-init.d/01-hermes-setup && \
     chmod +x /etc/cont-init.d/01-hermes-setup
-COPY --chmod=0755 docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-supervise-perms
-COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
+COPY docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-supervise-perms
+COPY docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
+RUN chmod 0755 /etc/cont-init.d/015-supervise-perms /etc/cont-init.d/02-reconcile-profiles
 
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
@@ -403,8 +424,9 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 # Recursion is impossible because the shim exec's the venv binary by
 # absolute path (/opt/hermes/.venv/bin/hermes). See the shim source for
 # the opt-out env var (HERMES_DOCKER_EXEC_AS_ROOT=1).
-COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
-COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
+COPY docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
+COPY docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
+RUN chmod 0755 /opt/hermes/bin/hermes /opt/hermes/docker/entrypoint-dispatch.sh
 
 # Pre-s6 entrypoint.sh did `source .venv/bin/activate` which exported
 # the venv bin onto PATH; Architecture B's main-wrapper.sh does the
@@ -481,7 +503,8 @@ CMD [ ]
 # is what makes the data tree writable by Heroku's random UID; heroku.yml
 # passes HERMES_DATA_MODE=0777.
 FROM runtime AS heroku
-COPY --chmod=0755 docker/heroku-entrypoint.sh /opt/hermes/docker/heroku-entrypoint.sh
+COPY docker/heroku-entrypoint.sh /opt/hermes/docker/heroku-entrypoint.sh
+RUN chmod 0755 /opt/hermes/docker/heroku-entrypoint.sh
 # The random Heroku UID has no passwd entry or home directory; anchor HOME on
 # the mutable data tree exactly as main-wrapper.sh does for the hermes user.
 ENV HOME=/opt/data
