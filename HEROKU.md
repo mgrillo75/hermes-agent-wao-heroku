@@ -249,11 +249,24 @@ below, and the answer determines the `HermesRuntimeSpecification`'s
 
 Record every result; these become the `HermesRuntimeSpecification`.
 
-- [ ] Image builds on Heroku via `heroku.yml`
-- [ ] Container starts under the random non-root UID with no `EACCES`
-- [ ] Web process binds `$PORT` inside the boot window
-- [ ] Process stays running (no crash loop); dyno cycling observed and timed
-- [ ] Health can be inspected programmatically (`GET /health` reachable)
+Status as of release **v11** (commit `6bbdf8a`, Hermes `0.20.1`):
+
+- [x] **Image builds on Heroku via `heroku.yml`** — only after removing all
+      BuildKit-only syntax; see the finding below
+- [x] **Container starts under the random non-root UID with no `EACCES`** —
+      observed `uid=13758`, data tree writable via `HERMES_DATA_MODE=0777`
+- [x] **Web process binds `$PORT` inside the boot window** — ~3.7 s from
+      entrypoint start to `HERMES_DASHBOARD_READY`, far inside the 60 s limit
+- [x] **Process stays running** — `web.1 up`, no crash loop
+- [x] **Model routing works end to end** — `hermes chat -q` returned the
+      expected token from `claude-sonnet-5` via `provider: anthropic` in 12 s
+- [x] **Dashboard auth gate is live** — unauthenticated request returns
+      `302 → /login?next=%2F`
+- [x] **Measured dyno size** — runs on **Basic (512 MB)**; no `R14`/`R15`
+      through boot, idle, and a chat turn. Performance-M is *not* required for
+      this workload. Untested stress case: the browser tool (Chromium).
+- [ ] Dyno cycling observed and timed (~24 h)
+- [ ] Health inspected programmatically (`GET /health` reachable)
 - [ ] The API/gateway surface the bootstrapper needs is reachable and
       authenticated (see §6)
 - [ ] Long operations survive the router timeout via an async pattern
@@ -261,10 +274,41 @@ Record every result; these become the `HermesRuntimeSpecification`.
 - [ ] Multiple profiles coexist in one runtime
 - [ ] Full inventory of state lost on restart, classified as reconstructable
       config / durable state / secret / cache / temp
-- [ ] Measured peak memory and the minimum viable dyno size
-- [ ] Image build time and cold-start time
+- [ ] Image build time and cold-start time recorded precisely
 - [ ] The deployment mechanism automation will reproduce (spec §13) exercised
       end-to-end
+
+### Findings from the first deployment
+
+**1. Heroku's builder is the classic Docker builder, not BuildKit.** The
+upstream Dockerfile used `COPY --chmod` in 8 places plus one `COPY --link`,
+and the build fails at the first one with *"the --chmod option requires
+BuildKit"*. All are now rewritten as `COPY` + `RUN chmod`, which builds under
+both builders. **Any future upstream merge must be re-checked for BuildKit
+syntax** — this is the most likely way a later version bump breaks the build.
+
+**2. Auxiliary models are not compatible with a direct Anthropic provider.**
+Observed during the chat test:
+
+```
+⚠ Auxiliary title generation failed: HTTP 400: response_format: Extra inputs are not permitted
+```
+
+Hermes' auxiliary tasks (title generation, context compression, vision,
+web-extract) default to `provider: "auto"` and fall back to the main endpoint,
+sending an OpenAI-shaped `response_format` that the Anthropic API rejects. The
+main chat turn is unaffected, but **context compression and vision will fail**
+— which matters for long-running WAO agents. Fix by pinning the
+`auxiliary.*.provider` block to a compatible provider, or accept the loss.
+Not yet resolved.
+
+**3. The `.env` picks up a deprecated `TERMINAL_CWD` entry.** Hermes warns
+`TERMINAL_CWD=/opt/data found in .env — this is deprecated`. Harmless, but it
+means something writes to `.env` beyond the entrypoint's `API_SERVER_KEY`.
+
+**4. `tirith` security scanner is enabled but not installed** in the image, so
+command scanning silently degrades to pattern matching. Cosmetic for the
+reference deployment; worth deciding deliberately for production.
 
 **Exit criterion:** a known-good deployment recipe exists and can be
 reproduced. Automated provisioning implements *this validated recipe* rather
